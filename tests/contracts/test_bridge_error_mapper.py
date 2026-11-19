@@ -7,6 +7,8 @@ Covers app/services/contracts/bridge_error_mapper.py:
 - Retryable and terminal errors are distinguished in status and headers.
 """
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -14,6 +16,8 @@ from fastapi.testclient import TestClient
 from app.services.contracts.bridge_error_mapper import (
     BRIDGE_ERROR_HTTP_STATUS,
     BRIDGE_RETRY_AFTER_SECONDS,
+    MALFORMED_BRIDGE_RESPONSE_MESSAGE,
+    RETRYABLE_BRIDGE_CODES,
     UNKNOWN_BRIDGE_ERROR_MESSAGE,
     BridgeError,
     BridgeErrorCode,
@@ -35,6 +39,7 @@ class TestKnownCodesMapped:
             (BridgeErrorCode.REJECTED, 422),
             (BridgeErrorCode.INSUFFICIENT_FUNDS, 402),
             (BridgeErrorCode.CONTRACT_ERROR, 502),
+            (BridgeErrorCode.MALFORMED_RESPONSE, 502),
             (BridgeErrorCode.UNKNOWN, 500),
         ],
     )
@@ -135,6 +140,137 @@ class TestRetryableVsTerminal:
             assert bridge_error_to_http(error).detail["retryable"] is expected, raw
 
 
+class TestTimeoutVersusMalformedResponse:
+    """Issue #1053: a timeout is retryable, a malformed response is terminal."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Request timed out after 30s",
+            "soroban rpc timeout",
+            "deadline exceeded",
+            "read timed out",
+        ],
+    )
+    def test_timeout_is_a_retryable_gateway_timeout(self, raw):
+        error = map_bridge_error(raw)
+        exc = bridge_error_to_http(error)
+
+        assert error.code is BridgeErrorCode.TIMEOUT
+        assert error.retryable is True
+        assert exc.status_code == 504
+        assert exc.headers == {"Retry-After": str(BRIDGE_RETRY_AFTER_SECONDS)}
+        assert exc.detail["retryable"] is True
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "malformed contract response",
+            "invalid JSON in bridge reply",
+            "could not parse contract payload",
+            "failed to decode result XDR",
+            "invalid XDR returned by soroban rpc",
+            "unexpected response shape from contract",
+            "schema mismatch: result is not a map",
+            "missing required field: status",
+            "Expecting value: line 1 column 1 (char 0)",
+        ],
+    )
+    def test_malformed_payload_is_a_terminal_upstream_error(self, raw):
+        error = map_bridge_error(raw)
+        exc = bridge_error_to_http(error)
+
+        assert error.code is BridgeErrorCode.MALFORMED_RESPONSE
+        assert error.retryable is False
+        assert exc.status_code == 502
+        assert exc.headers is None
+        assert exc.detail == {
+            "error_code": "MALFORMED_RESPONSE",
+            "message": MALFORMED_BRIDGE_RESPONSE_MESSAGE,
+            "retryable": False,
+        }
+
+    def test_the_two_classes_differ_in_code_status_and_retry(self):
+        timeout = bridge_error_to_http(map_bridge_error("request timed out"))
+        malformed = bridge_error_to_http(map_bridge_error("malformed response"))
+
+        assert timeout.detail["error_code"] != malformed.detail["error_code"]
+        assert timeout.status_code != malformed.status_code
+        assert timeout.detail["retryable"] is True
+        assert malformed.detail["retryable"] is False
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            TimeoutError(),
+            TimeoutError("could not parse anything before the deadline"),
+        ],
+    )
+    def test_timeout_exception_type_wins_over_its_text(self, raw):
+        error = map_bridge_error(raw)
+
+        assert error.code is BridgeErrorCode.TIMEOUT
+        assert error.retryable is True
+
+    def test_json_decode_error_is_malformed_whatever_its_text_says(self):
+        try:
+            json.loads("request timed out")
+        except json.JSONDecodeError as exc:
+            error = map_bridge_error(exc)
+
+        assert error.code is BridgeErrorCode.MALFORMED_RESPONSE
+        assert error.retryable is False
+
+    def test_unicode_decode_error_is_malformed(self):
+        try:
+            b"\xff\xfe".decode("utf-8")
+        except UnicodeDecodeError as exc:
+            error = map_bridge_error(exc)
+
+        assert error.code is BridgeErrorCode.MALFORMED_RESPONSE
+
+    def test_payload_text_mentioning_a_timeout_field_is_not_retried(self):
+        raw = 'invalid response: missing required field "timeout_ledger"'
+
+        error = map_bridge_error(raw)
+
+        assert error.code is BridgeErrorCode.MALFORMED_RESPONSE
+        assert bridge_error_to_http(error).detail["retryable"] is False
+
+    def test_malformed_message_does_not_leak_the_payload(self):
+        payload = '{"secret_key": "SB3X-EXAMPLE", "sta'
+        exc = bridge_error_to_http(
+            map_bridge_error(f"could not parse contract payload: {payload}")
+        )
+
+        assert exc.detail["message"] == MALFORMED_BRIDGE_RESPONSE_MESSAGE
+        assert "SB3X-EXAMPLE" not in str(exc.detail)
+
+    def test_the_raw_error_is_kept_for_server_side_logging(self):
+        raw = "could not parse contract payload: {..."
+
+        error = map_bridge_error(raw)
+
+        assert error.message == raw
+        assert error.upstream_error == raw
+
+    def test_only_timeout_and_network_errors_are_retryable_classes(self):
+        assert RETRYABLE_BRIDGE_CODES == RETRYABLE_CODES
+
+    @pytest.mark.parametrize("code", sorted(TERMINAL_CODES))
+    def test_a_terminal_code_flagged_retryable_is_still_not_advertised(self, code):
+        exc = bridge_error_to_http(BridgeError(code=code, message="m", retryable=True))
+
+        assert exc.detail["retryable"] is False
+        assert exc.headers is None
+
+    def test_contract_errors_are_still_classified_as_contract_errors(self):
+        assert (
+            map_bridge_error("soroban invoke failed: wasm trap").code
+            is BridgeErrorCode.CONTRACT_ERROR
+        )
+
+
 class TestHttpResponseShape:
     """The HTTPException renders as a real API response through FastAPI."""
 
@@ -172,3 +308,14 @@ class TestHttpResponseShape:
         assert resp.status_code == 500
         assert resp.json()["detail"]["error_code"] == "UNKNOWN"
         assert resp.json()["detail"]["message"] == UNKNOWN_BRIDGE_ERROR_MESSAGE
+
+    def test_malformed_response(self, client):
+        resp = client.get("/bridge/malformed contract response")
+
+        assert resp.status_code == 502
+        assert "Retry-After" not in resp.headers
+        assert resp.json()["detail"] == {
+            "error_code": "MALFORMED_RESPONSE",
+            "message": MALFORMED_BRIDGE_RESPONSE_MESSAGE,
+            "retryable": False,
+        }
